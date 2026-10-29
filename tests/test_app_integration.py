@@ -178,3 +178,129 @@ def test_main_graph_recovers_without_repeating_completed_specialists(
     ).read_text(encoding="utf-8")
     assert "d-1042" in runbook
     assert "Metrics:" in runbook
+
+
+def test_end_to_end_approval_publishes_runbook(tmp_path, monkeypatch):
+    from langgraph.types import Command
+
+    monkeypatch.delenv("TRIAGE_FAIL", raising=False)
+    runbook_dir = tmp_path / "approved-runbooks"
+    monkeypatch.setattr(app, "RUNBOOK_DIR", runbook_dir)
+
+    def fake_analysis(state):
+        return {
+            "analysis": {
+                "severity": "SEV2",
+                "summary": "Checkout failures require review.",
+                "proposed_action": "Review checkout-api health and recent logs.",
+                "risk": "medium",
+                "rationale": "Mocked evidence for approval integration testing.",
+            },
+            "status": "analyzed",
+            "audit_log": state.get("audit_log", [])
+            + ["Mock analyst used in approval integration test."],
+        }
+
+    monkeypatch.setattr(app, "analyze_incident", fake_analysis)
+    config = {"configurable": {"thread_id": "test-e2e-approval"}}
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "approval.sqlite")) as saver:
+        graph = app.build_graph(saver)
+        paused = graph.invoke(
+            {
+                "incident_id": "INC-2041",
+                "incident": "checkout-api is returning HTTP 500 errors.",
+                "status": "new",
+                "audit_log": [],
+            },
+            config=config,
+        )
+
+        assert paused.get("__interrupt__"), "Expected graph to pause for approval."
+        payload = paused["__interrupt__"][0].value
+        assert payload["allowed_decisions"] == ["approve", "reject"]
+        assert payload["owning_team"] == "payments"
+        assert payload["on_call"] == "@payments-oncall"
+
+        result = graph.invoke(
+            Command(
+                resume={
+                    "decision": "approve",
+                    "reviewer": "reviewer-123",
+                    "reason": "",
+                }
+            ),
+            config=config,
+        )
+
+    assert result["status"] == "published"
+    assert result["approval_reviewer"] == "reviewer-123"
+    assert result["owner_team"] == "payments"
+    assert result["owner_on_call"] == "@payments-oncall"
+    assert any("Approval decision: approve by reviewer-123" in item
+               for item in result["audit_log"])
+
+    runbook = (runbook_dir / "INC-2041.md").read_text(encoding="utf-8")
+    assert "Owning team: payments" in runbook
+    assert "On-call contact: @payments-oncall" in runbook
+    assert "Approval reviewer: reviewer-123" in runbook
+
+
+def test_end_to_end_rejection_does_not_publish_runbook(tmp_path, monkeypatch):
+    from langgraph.types import Command
+
+    monkeypatch.delenv("TRIAGE_FAIL", raising=False)
+    runbook_dir = tmp_path / "rejected-runbooks"
+    monkeypatch.setattr(app, "RUNBOOK_DIR", runbook_dir)
+
+    def fake_analysis(state):
+        return {
+            "analysis": {
+                "severity": "SEV2",
+                "summary": "Checkout failures require review.",
+                "proposed_action": "Review checkout-api health and recent logs.",
+                "risk": "medium",
+                "rationale": "Mocked evidence for rejection integration testing.",
+            },
+            "status": "analyzed",
+            "audit_log": state.get("audit_log", [])
+            + ["Mock analyst used in rejection integration test."],
+        }
+
+    monkeypatch.setattr(app, "analyze_incident", fake_analysis)
+    config = {"configurable": {"thread_id": "test-e2e-rejection"}}
+    rejection_reason = "Evidence is insufficient; investigate further first."
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "rejection.sqlite")) as saver:
+        graph = app.build_graph(saver)
+        paused = graph.invoke(
+            {
+                "incident_id": "INC-2041",
+                "incident": "checkout-api is returning HTTP 500 errors.",
+                "status": "new",
+                "audit_log": [],
+            },
+            config=config,
+        )
+
+        assert paused.get("__interrupt__"), "Expected graph to pause for approval."
+
+        result = graph.invoke(
+            Command(
+                resume={
+                    "decision": "reject",
+                    "reviewer": "reviewer-456",
+                    "reason": rejection_reason,
+                }
+            ),
+            config=config,
+        )
+
+    assert result["status"] == "rejected_without_publish"
+    assert result["approval_reviewer"] == "reviewer-456"
+    assert result["rejection_reason"] == rejection_reason
+    assert any(f"Rejection reason: {rejection_reason}" in item
+               for item in result["audit_log"])
+    assert not (runbook_dir / "INC-REJECT-E2E.md").exists()
+
+
