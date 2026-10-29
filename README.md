@@ -46,6 +46,41 @@ python3 app.py start --thread smoke-001 --incident "Checkout API returns HTTP 50
 
 You should see `WORKFLOW PAUSED` and an approval payload. The `LangChainBetaWarning` about the v3 streaming protocol is expected.
 
+## Reviewer authorization
+
+Approval and rejection decisions require reviewer IDs listed in the `TRIAGE_APPROVED_REVIEWERS` environment variable.
+
+### Configure authorized reviewers
+
+**Windows PowerShell:**
+
+```powershell
+$env:TRIAGE_APPROVED_REVIEWERS = "reviewer-123,reviewer-456"
+```
+
+**Linux or macOS:**
+
+```bash
+export TRIAGE_APPROVED_REVIEWERS="reviewer-123,reviewer-456"
+```
+
+Replace the example IDs with the reviewer IDs used by your workflow. The PowerShell setting applies only to the current session.
+
+### Authorization behavior
+
+- An empty or unset allowlist denies approval and rejection decisions.
+- A reviewer ID not on the allowlist is denied.
+- Rejections require a reason.
+
+### Security limitation
+
+The allowlist checks the submitted reviewer ID; it does not verify the submitter's real identity. This is an interim safeguard, not production-grade authentication. Integrate a trusted identity provider before production use.
+
+### Run the tests
+
+```bash
+python -m pytest -q
+```
 ## Cost
 
 Each run makes a few Gemini 3.7 Flash calls, which costs a few cents at most. Cloud Shell is free.
