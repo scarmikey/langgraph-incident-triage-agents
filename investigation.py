@@ -1,9 +1,29 @@
+import json
+from pathlib import Path
 from typing import TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from specialists import metric_window, recent_deploys, search_logs
+
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+def resolve_incident_service(incident_id: str) -> str:
+    """Resolve an incident ID to its affected service using local fixtures."""
+    alerts = json.loads(
+        (DATA_DIR / "alerts.json").read_text(encoding="utf-8")
+    )
+
+    for alert in alerts:
+        if alert["id"] == incident_id:
+            return alert["service"]
+
+    raise ValueError(
+        f"No service mapping found for incident {incident_id}."
+    )
 
 
 class InvestigationState(TypedDict, total=False):

@@ -11,6 +11,13 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from investigation import (
+    investigate_deployments,
+    investigate_logs,
+    investigate_metrics,
+    resolve_incident_service,
+)
+
 MODEL_ID = "gemini-3.7-flash"
 DB_PATH = "incident_checkpoints.db"
 RUNBOOK_DIR = Path("runbooks")
@@ -59,6 +66,21 @@ class IncidentState(TypedDict, total=False):
     status: str
     audit_log: list[str]
     runbook_path: str
+    service: str
+    logs_findings: str
+    deployment_findings: str
+    metrics_findings: str
+
+
+def resolve_service(state: IncidentState):
+    service = resolve_incident_service(state["incident_id"])
+    audit_log = state.get("audit_log", []) + [
+        f"Resolved incident {state['incident_id']} to service {service}."
+    ]
+    return {
+        "service": service,
+        "audit_log": audit_log,
+    }
 
 
 def build_analyst():
@@ -92,22 +114,38 @@ def safe_incident_id(incident_id: str) -> str:
 
 def analyze_incident(state: IncidentState):
     analyst = build_analyst()
+
+    investigation_context = (
+        f"Service: {state['service']}\n\n"
+        f"Logs:\n{state['logs_findings']}\n\n"
+        f"Recent deployments:\n{state['deployment_findings']}\n\n"
+        f"Metrics:\n{state['metrics_findings']}"
+    )
+
     analysis = analyst.invoke(
         [
             (
                 "system",
                 "You are an SRE incident analyst. Classify the incident and "
-                "propose one reversible remediation step. Keep every field concise.",
+                "propose one reversible remediation step. Keep every field "
+                "concise. Use the supplied investigation findings as evidence. "
+                "Distinguish observed facts from hypotheses; do not claim a "
+                "root cause unless the evidence supports it.",
             ),
-            ("human", state["incident"]),
+            (
+                "human",
+                f"Incident:\n{state['incident']}\n\n"
+                f"Investigation findings:\n{investigation_context}",
+            ),
         ]
     )
+
     return {
         "analysis": analysis,
         "status": "analyzed",
-        "audit_log": ["Model produced structured incident analysis."],
+        "audit_log": state.get("audit_log", [])
+        + ["Model produced structured incident analysis using investigation findings."],
     }
-
 
 def policy_check(state: IncidentState):
     analysis = state["analysis"]
@@ -181,6 +219,11 @@ def publish_runbook(state: IncidentState):
         f"Model risk: {analysis['risk']}\n\n"
         f"Policy result: {state['policy_reason']}\n\n"
         f"Approval outcome: {approval_outcome}\n\n"
+        "Investigation findings:\n\n"
+        f"Service: {state['service']}\n\n"
+        f"Logs:\n{state['logs_findings']}\n\n"
+        f"Deployments:\n{state['deployment_findings']}\n\n"
+        f"Metrics:\n{state['metrics_findings']}\n\n"
         "Audit log:\n"
         f"{audit_lines}\n",
         encoding="utf-8",
@@ -201,13 +244,30 @@ def reject_runbook(state: IncidentState):
 
 def build_graph(checkpointer: SqliteSaver):
     builder = StateGraph(IncidentState)
+
+    builder.add_node("resolve_service", resolve_service)
+    builder.add_node("logs_specialist", investigate_logs)
+    builder.add_node("deployment_specialist", investigate_deployments)
+    builder.add_node("metrics_specialist", investigate_metrics)
     builder.add_node("analyze_incident", analyze_incident)
     builder.add_node("policy_check", policy_check)
     builder.add_node("approval_gate", approval_gate)
     builder.add_node("publish_runbook", publish_runbook)
     builder.add_node("reject_runbook", reject_runbook)
 
-    builder.add_edge(START, "analyze_incident")
+    # Resolve the incident, then run the three specialists in parallel.
+    builder.add_edge(START, "resolve_service")
+    builder.add_edge("resolve_service", "logs_specialist")
+    builder.add_edge("resolve_service", "deployment_specialist")
+    builder.add_edge("resolve_service", "metrics_specialist")
+
+    # Do not analyze until all three specialists have completed.
+    builder.add_edge(
+        ["logs_specialist", "deployment_specialist", "metrics_specialist"],
+        "analyze_incident",
+    )
+
+    # Preserve the original policy, approval, rejection, and publishing flow.
     builder.add_edge("analyze_incident", "policy_check")
     builder.add_conditional_edges("policy_check", policy_route)
     builder.add_conditional_edges("approval_gate", approval_route)
@@ -215,7 +275,6 @@ def build_graph(checkpointer: SqliteSaver):
     builder.add_edge("reject_runbook", END)
 
     return builder.compile(checkpointer=checkpointer)
-
 
 def display_stream(stream):
     final_state = stream.output
