@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,10 @@ class IncidentState(TypedDict, total=False):
     audit_log: list[str]
     runbook_path: str
     service: str
+    owner_team: str
+    owner_on_call: str
+    approval_reviewer: str
+    rejection_reason: str
     logs_findings: str
     deployment_findings: str
     metrics_findings: str
@@ -74,11 +79,31 @@ class IncidentState(TypedDict, total=False):
 
 def resolve_service(state: IncidentState):
     service = resolve_incident_service(state["incident_id"])
+
+    services_path = Path("data/services.json")
+    services = json.loads(services_path.read_text(encoding="utf-8"))
+    service_config = services.get(service)
+
+    if service_config is None:
+        raise ValueError(f"No configuration found for service: {service}")
+
+    owner_team = service_config.get("team")
+    if not owner_team:
+        raise ValueError(f"No owning team configured for service: {service}")
+
+    owner_on_call = service_config.get("on_call")
+    if not owner_on_call:
+        raise ValueError(f"No on-call contact configured for service: {service}")
+
     audit_log = state.get("audit_log", []) + [
-        f"Resolved incident {state['incident_id']} to service {service}."
+        f"Resolved incident {state['incident_id']} to service {service}.",
+        f"Resolved owning team for {service}: {owner_team}.",
+        f"Resolved on-call contact for {service}: {owner_on_call}.",
     ]
     return {
         "service": service,
+        "owner_team": owner_team,
+        "owner_on_call": owner_on_call,
         "audit_log": audit_log,
     }
 
@@ -175,24 +200,63 @@ def policy_route(state: IncidentState) -> Literal["approval_gate", "publish_runb
 
 
 def approval_gate(state: IncidentState):
-    decision = interrupt(
+    response = interrupt(
         {
             "question": "Approve this remediation proposal?",
             "incident_id": state["incident_id"],
             "incident": state["incident"],
             "analysis": state["analysis"],
             "policy_reason": state["policy_reason"],
+            "service": state.get("service"),
+            "owning_team": state.get("owner_team"),
+            "on_call": state.get("owner_on_call"),
             "allowed_decisions": ["approve", "reject"],
+            "required_response": {
+                "decision": "approve or reject",
+                "reviewer": "name or unique reviewer identifier",
+                "reason": "required when decision is reject",
+            },
         }
     )
+
+    if isinstance(response, str):
+        decision = response
+        reviewer = "legacy CLI (identity not supplied)"
+        reason = ""
+    elif isinstance(response, dict):
+        decision = response.get("decision")
+        reviewer = response.get("reviewer")
+        reason = response.get("reason", "")
+        reviewer = reviewer.strip() if isinstance(reviewer, str) else ""
+        reason = reason.strip() if isinstance(reason, str) else ""
+    else:
+        raise ValueError(
+            "Approval response must be a decision string or object."
+        )
+
     if decision not in ("approve", "reject"):
         raise ValueError("Decision must be 'approve' or 'reject'.")
+    if not reviewer:
+        raise ValueError("Reviewer identity is required.")
+    if decision == "reject" and not reason:
+        raise ValueError("A reason is required when rejecting a proposal.")
+
     approved = decision == "approve"
+    audit_log = state.get("audit_log", []) + [
+        (
+            f"Approval decision: {decision} by {reviewer} "
+            f"for owning team {state.get('owner_team', 'unknown')}."
+        )
+    ]
+    if not approved:
+        audit_log.append(f"Rejection reason: {reason}")
+
     return {
         "decision": approved,
+        "approval_reviewer": reviewer,
+        "rejection_reason": reason if not approved else "",
         "status": "approved" if approved else "rejected",
-        "audit_log": state["audit_log"]
-        + ["Human approved the proposal." if approved else "Human rejected the proposal."],
+        "audit_log": audit_log,
     }
 
 
@@ -212,6 +276,8 @@ def publish_runbook(state: IncidentState):
         "# Policy-Controlled Incident Runbook\n\n"
         f"Incident ID: {state['incident_id']}\n\n"
         f"Incident: {state['incident']}\n\n"
+        f"Owning team: {state.get('owner_team', 'Not specified')}\n\n"
+        f"On-call contact: {state.get('owner_on_call', 'Not specified')}\n\n"
         f"Severity: {analysis['severity']}\n\n"
         f"Summary: {analysis['summary']}\n\n"
         f"Proposed action: {analysis['proposed_action']}\n\n"
@@ -219,6 +285,7 @@ def publish_runbook(state: IncidentState):
         f"Model risk: {analysis['risk']}\n\n"
         f"Policy result: {state['policy_reason']}\n\n"
         f"Approval outcome: {approval_outcome}\n\n"
+        f"Approval reviewer: {state.get('approval_reviewer', 'Not required')}\n\n"
         "Investigation findings:\n\n"
         f"Service: {state['service']}\n\n"
         f"Logs:\n{state['logs_findings']}\n\n"
@@ -304,6 +371,16 @@ def parse_args():
         choices=["approve", "reject"],
         required=True,
     )
+    resume_parser.add_argument(
+        "--reviewer",
+        default=getpass.getuser(),
+        help="Reviewer identifier recorded in the audit log.",
+    )
+    resume_parser.add_argument(
+        "--reason",
+        default="",
+        help="Required explanation when rejecting a proposal.",
+    )
 
     return parser.parse_args()
 
@@ -323,7 +400,19 @@ def main():
                 "audit_log": [],
             }
         else:
-            graph_input = Command(resume=args.decision)
+            if not args.reviewer.strip():
+                raise SystemExit("--reviewer must not be empty.")
+            if args.decision == "reject" and not args.reason.strip():
+                raise SystemExit(
+                    "--reason is required when --decision is reject."
+                )
+            graph_input = Command(
+                resume={
+                    "decision": args.decision,
+                    "reviewer": args.reviewer.strip(),
+                    "reason": args.reason.strip(),
+                }
+            )
 
         stream = graph.stream_events(
             graph_input,
