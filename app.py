@@ -238,6 +238,17 @@ def approval_gate(state: IncidentState):
         raise ValueError("Decision must be 'approve' or 'reject'.")
     if not reviewer:
         raise ValueError("Reviewer identity is required.")
+
+    allowed_reviewers = {
+        item.strip()
+        for item in os.getenv("TRIAGE_APPROVED_REVIEWERS", "").split(",")
+        if item.strip()
+    }
+    if not allowed_reviewers:
+        raise PermissionError("No authorized reviewers are configured.")
+    if reviewer not in allowed_reviewers:
+        raise PermissionError("Reviewer is not authorized to make approval decisions.")
+
     if decision == "reject" and not reason:
         raise ValueError("A reason is required when rejecting a proposal.")
 

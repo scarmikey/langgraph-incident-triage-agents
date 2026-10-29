@@ -23,6 +23,7 @@ def make_state():
 
 
 def test_approval_records_reviewer_and_team(monkeypatch):
+    monkeypatch.setenv("TRIAGE_APPROVED_REVIEWERS", "reviewer-123")
     monkeypatch.setattr(
         app,
         "interrupt",
@@ -41,6 +42,7 @@ def test_approval_records_reviewer_and_team(monkeypatch):
 
 
 def test_rejection_records_reason(monkeypatch):
+    monkeypatch.setenv("TRIAGE_APPROVED_REVIEWERS", "reviewer-456")
     monkeypatch.setattr(
         app,
         "interrupt",
@@ -61,6 +63,7 @@ def test_rejection_records_reason(monkeypatch):
 
 
 def test_rejection_requires_reason(monkeypatch):
+    monkeypatch.setenv("TRIAGE_APPROVED_REVIEWERS", "reviewer-456")
     monkeypatch.setattr(
         app,
         "interrupt",
@@ -137,3 +140,32 @@ def test_rejection_route_does_not_call_publisher(monkeypatch):
     monkeypatch.setattr(app, "publish_runbook", unexpected_publish)
 
     assert app.approval_route(state) == "reject_runbook"
+
+def test_approval_denied_when_allowlist_is_missing(monkeypatch):
+    monkeypatch.delenv("TRIAGE_APPROVED_REVIEWERS", raising=False)
+    monkeypatch.setattr(
+        app,
+        "interrupt",
+        lambda payload: {
+            "decision": "approve",
+            "reviewer": "reviewer-123",
+            "reason": "",
+        },
+    )
+    with pytest.raises(PermissionError, match="No authorized reviewers"):
+        app.approval_gate(make_state())
+
+
+def test_approval_denied_for_unauthorized_reviewer(monkeypatch):
+    monkeypatch.setenv("TRIAGE_APPROVED_REVIEWERS", "reviewer-123")
+    monkeypatch.setattr(
+        app,
+        "interrupt",
+        lambda payload: {
+            "decision": "approve",
+            "reviewer": "reviewer-999",
+            "reason": "",
+        },
+    )
+    with pytest.raises(PermissionError, match="not authorized"):
+        app.approval_gate(make_state())

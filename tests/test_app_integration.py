@@ -181,6 +181,7 @@ def test_main_graph_recovers_without_repeating_completed_specialists(
 
 
 def test_end_to_end_approval_publishes_runbook(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRIAGE_APPROVED_REVIEWERS", "reviewer-123")
     from langgraph.types import Command
 
     monkeypatch.delenv("TRIAGE_FAIL", raising=False)
@@ -247,6 +248,7 @@ def test_end_to_end_approval_publishes_runbook(tmp_path, monkeypatch):
 
 
 def test_end_to_end_rejection_does_not_publish_runbook(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRIAGE_APPROVED_REVIEWERS", "reviewer-456")
     from langgraph.types import Command
 
     monkeypatch.delenv("TRIAGE_FAIL", raising=False)
